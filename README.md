@@ -1,5 +1,3 @@
-# Entra-Connect-Synchronization-Process
-
 # Microsoft Entra Connect Sync — How Objects Flow (Reference Guide)
 
 > Personal reference for understanding and troubleshooting Entra Connect Sync: how an object moves from **AD DS → AD Connector Space → Metaverse → Entra Connector Space → Entra ID**, which accounts do what, and how to safely promote a staging server.
@@ -45,6 +43,19 @@ flowchart LR
     AADCS -- "5. Export" --> AAD
     ADCS -. "4. Export (writeback)" .-> AD
 ```
+
+**The same flow, step by step:**
+
+| Step | Action | From | To | What happens | Runs on staging server? |
+|---|---|---|---|---|---|
+| 1 | **Import from AD** | On-prem AD DS | AD Connector Space | The AD DS Connector account reads in-scope users, groups, and contacts. New or changed data is staged as **pending import**. | ✅ Yes |
+| 2 | **Import from Entra ID** | Microsoft Entra ID | Entra Connector Space | The Entra Connector account reads what already exists in the tenant, so the engine knows the current cloud state. | ✅ Yes |
+| 3a | **Inbound sync** | AD Connector Space | Metaverse | Inbound sync rules decide whether the object is in scope, then either **join** it to an existing MV object or **project** a new one, and flow its attributes in. | ✅ Yes |
+| 3b | **Outbound sync** | Metaverse | Entra Connector Space (and AD CS for writeback) | Outbound sync rules **provision** or update the object in the Entra CS. The difference from the current cloud state becomes a **pending export**. | ✅ Yes |
+| 4 | **Export to AD** *(writeback only)* | AD Connector Space | On-prem AD DS | Writes back cloud-sourced data, such as password writeback, group writeback, or `ms-DS-ConsistencyGuid`. | ❌ No |
+| 5 | **Export to Entra ID** | Entra Connector Space | Microsoft Entra ID | Pending exports are pushed to the tenant, where objects are created, updated, or deleted. The next Entra import confirms they landed. | ❌ No |
+
+> Steps 1, 2, and 3 only read from directories or work inside the database. **Only steps 4 and 5 write to a real directory**, and those are exactly the steps staging mode blocks.
 
 **Mental model:** think of it like an airport.
 
