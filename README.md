@@ -44,18 +44,41 @@ flowchart LR
     ADCS -. "4. Export (writeback)" .-> AD
 ```
 
-**The same flow, step by step:**
+**The same flow, step by step — with the WHY and a real example:**
 
-| Step | Action | From | To | What happens | Runs on staging server? |
-|---|---|---|---|---|---|
-| 1 | **Import from AD** | On-prem AD DS | AD Connector Space | The AD DS Connector account reads in-scope users, groups, and contacts. New or changed data is staged as **pending import**. | ✅ Yes |
-| 2 | **Import from Entra ID** | Microsoft Entra ID | Entra Connector Space | The Entra Connector account reads what already exists in the tenant, so the engine knows the current cloud state. | ✅ Yes |
-| 3a | **Inbound sync** | AD Connector Space | Metaverse | Inbound sync rules decide whether the object is in scope, then either **join** it to an existing MV object or **project** a new one, and flow its attributes in. | ✅ Yes |
-| 3b | **Outbound sync** | Metaverse | Entra Connector Space (and AD CS for writeback) | Outbound sync rules **provision** or update the object in the Entra CS. The difference from the current cloud state becomes a **pending export**. | ✅ Yes |
-| 4 | **Export to AD** *(writeback only)* | AD Connector Space | On-prem AD DS | Writes back cloud-sourced data, such as password writeback, group writeback, or `ms-DS-ConsistencyGuid`. | ❌ No |
-| 5 | **Export to Entra ID** | Entra Connector Space | Microsoft Entra ID | Pending exports are pushed to the tenant, where objects are created, updated, or deleted. The next Entra import confirms they landed. | ❌ No |
+**Example object:** Marcus Lee, a new nurse. HR's provisioning process creates him in `OU=Nursing,OU=Staff,DC=contoso,DC=com`, which is in sync scope. Password Hash Sync is enabled.
+
+| Step | Action | From → To | What happens | ❓ Why this step exists | 🧑‍⚕️ Example: Marcus Lee | Runs on staging? |
+|---|---|---|---|---|---|---|
+| 1 | **Import from AD** | AD DS → AD Connector Space | The AD DS Connector account reads in-scope objects. New or changed data is staged as **pending import**. | The sync engine never works against live AD. It takes a **local snapshot** first so rules can be evaluated quickly and safely without hammering domain controllers. Delta imports only pull what changed since the last watermark, which keeps cycles fast. | The delta import sees a new user. Marcus lands in the AD CS as **Pending Import: Add**, holding `sAMAccountName=mlee`, `userPrincipalName=mlee@contoso.com`, `title=Registered Nurse`, and `objectGUID=0b4c6f4e-3a1d-4b5e-9c2f-7d8e1a2b3c4d`. | ✅ Yes |
+| 2 | **Import from Entra ID** | Entra ID → Entra Connector Space | The Entra Connector account reads what already exists in the tenant. | The engine needs to know the **current cloud state** before deciding what to change. Without it, it couldn't tell "create" from "update," would re-send unchanged data, and couldn't confirm that previous exports actually landed. | The import finds **no** cloud object matching Marcus. The engine now knows he must be **created**, not updated. | ✅ Yes |
+| 3a | **Inbound sync** | AD Connector Space → Metaverse | Inbound rules check scope, then **join** the object to an existing MV object or **project** a new one, and flow attributes in. | AD isn't always the only source. A person might exist in two forests (an account forest and a resource forest), so the MV merges every source into **one identity** and resolves conflicts by rule precedence. Scoping filters also drop objects that should never sync, such as critical system objects. | "In from AD – User Join" finds no existing MV object for Marcus, so "In from AD – User Common" **projects** a new MV `person`. His `objectGUID` (via `ms-DS-ConsistencyGuid`) becomes the MV `sourceAnchor`, and `title` flows into `jobTitle`. | ✅ Yes |
+| 3b | **Outbound sync** | Metaverse → Entra Connector Space | Outbound rules **provision** or update the object in the Entra CS. The difference from the current cloud state becomes a **pending export**. | This is where the engine shapes the identity **for the target system**: it filters (`cloudFiltered`), transforms attributes to Entra's schema, and calculates only the **delta** to send. The result is a reviewable to-do list, which is what staging servers let you inspect. | "Out to AAD – User Join" provisions Marcus into the Entra CS as **Pending Export: Add**, with `ImmutableId = Tm9MCx06XkucL32OGis8TQ==` (his GUID in base64). | ✅ Yes |
+| 4 | **Export to AD** *(writeback only)* | AD Connector Space → AD DS | Writes cloud-sourced or engine-generated data back on-prem. | Some features need on-prem AD updated: password writeback (SSPR), group writeback, and stamping `ms-DS-ConsistencyGuid` so the anchor survives a forest migration. | If `ms-DS-ConsistencyGuid` was empty, Connect writes `0b4c6f4e-…` into it on Marcus's AD account. That way, his anchor survives even if he's later moved to another forest. | ❌ No |
+| 5 | **Export to Entra ID** | Entra Connector Space → Entra ID | Pending exports are pushed to the tenant, where objects are created, updated, or deleted. | Only now does a real change hit production. Keeping it as the **last, separate step** lets the engine batch changes, enforce the deletion threshold (500 by default), and skip it entirely in staging mode. | Marcus is created in Entra ID as `mlee@contoso.com` with *Directory synced = Yes*. On the **next Entra import**, the pending export clears, which confirms the create landed. PHS then sends his password hash separately, roughly every 2 minutes. | ❌ No |
 
 > Steps 1, 2, and 3 only read from directories or work inside the database. **Only steps 4 and 5 write to a real directory**, and those are exactly the steps staging mode blocks.
+
+**How Marcus's attributes transform along the way:**
+
+| On-prem AD attribute | Metaverse attribute | Entra ID attribute | Why it matters |
+|---|---|---|---|
+| `objectGUID` / `ms-DS-ConsistencyGuid` = `0b4c6f4e-3a1d-4b5e-9c2f-7d8e1a2b3c4d` | `sourceAnchor` | `onPremisesImmutableId` = `Tm9MCx06XkucL32OGis8TQ==` | The **permanent link** between the on-prem and cloud objects, used for hard matching. If it changes, sync treats him as a different person. |
+| `sAMAccountName` = `mlee` | `accountName` | `onPremisesSamAccountName` = `mlee` | Keeps a record of his on-prem logon name in the cloud. |
+| `userPrincipalName` = `mlee@contoso.com` | `userPrincipalName` | `userPrincipalName` = `mlee@contoso.com` | His sign-in name. The suffix must be a **verified domain**, or he gets `@tenant.onmicrosoft.com` instead. |
+| `displayName` = `Marcus Lee` | `displayName` | `displayName` = `Marcus Lee` | What users see in the GAL, Teams, and the portal. |
+| `title` = `Registered Nurse` | `jobTitle` | `jobTitle` = `Registered Nurse` | Shows that names can differ between systems. Sync rules map the AD name to the Entra name. |
+| `department` = `Nursing` | `department` | `department` = `Nursing` | Often drives **dynamic groups** and licensing in the cloud, so a typo here has real access impact. |
+| `mail` / `proxyAddresses` | `mail` / `proxyAddresses` | `mail` / `proxyAddresses` | Used for **soft matching** and Exchange Online. Duplicates cause `AttributeValueMustBeUnique` export errors. |
+
+**What happens on a later change?** Say Marcus is promoted and his `title` changes to `Charge Nurse`:
+
+| Step | Result |
+|---|---|
+| 1. Import AD | AD CS shows **Pending Import: Update** (Old: Registered Nurse / New: Charge Nurse). |
+| 2. Import Entra | Cloud still shows `Registered Nurse`. |
+| 3a/3b. Sync | MV `jobTitle` is updated, and the engine sees the Entra CS differs, so it creates **Pending Export: Update jobTitle**. |
+| 5. Export | Entra ID `jobTitle` becomes `Charge Nurse`. Only that one attribute is sent, not his whole object. |
 
 **Mental model:** think of it like an airport.
 
