@@ -11,7 +11,7 @@
 1. [The Big Picture](#1-the-big-picture)
 2. [Key Terminology](#2-key-terminology)
 3. [The Accounts](#3-the-accounts)
-4. [The 5 Sync Steps](#4-the-5-sync-steps)
+4. [The 7 Sync Steps](#4-the-7-sync-steps)
 5. [Inside the Engine: Connector Space & Metaverse](#5-inside-the-engine-connector-space--metaverse)
 6. [Walkthrough: Following "Jane Doe" End-to-End](#6-walkthrough-following-jane-doe-end-to-end)
 7. [Run Profiles & the Scheduler](#7-run-profiles--the-scheduler)
@@ -37,11 +37,11 @@ flowchart LR
 
     AD -- "1. Import" --> ADCS
     AAD -- "2. Import" --> AADCS
-    ADCS -- "3a. Inbound sync rules" --> MV
-    MV -- "3b. Outbound sync rules" --> AADCS
-    MV -. "3b. Outbound (writeback)" .-> ADCS
-    AADCS -- "5. Export" --> AAD
-    ADCS -. "4. Export (writeback)" .-> AD
+    ADCS -- "3. Inbound sync" --> MV
+    MV -- "4. Outbound sync" --> AADCS
+    MV -. "5. Outbound sync (writeback)" .-> ADCS
+    AADCS -- "6. Export" --> AAD
+    ADCS -. "7. Export (writeback)" .-> AD
 ```
 
 **The same flow, step by step — with the WHY and a real example:**
@@ -52,12 +52,13 @@ flowchart LR
 |---|---|---|---|---|---|---|
 | 1 | **Import from AD** | AD DS → AD Connector Space | The AD DS Connector account reads in-scope objects. New or changed data is staged as **pending import**. | The sync engine never works against live AD. It takes a **local snapshot** first so rules can be evaluated quickly and safely without hammering domain controllers. Delta imports only pull what changed since the last watermark, which keeps cycles fast. | The delta import sees a new user. Marcus lands in the AD CS as **Pending Import: Add**, holding `sAMAccountName=mlee`, `userPrincipalName=mlee@contoso.com`, `title=Registered Nurse`, and `objectGUID=0b4c6f4e-3a1d-4b5e-9c2f-7d8e1a2b3c4d`. | ✅ Yes |
 | 2 | **Import from Entra ID** | Entra ID → Entra Connector Space | The Entra Connector account reads what already exists in the tenant. | The engine needs to know the **current cloud state** before deciding what to change. Without it, it couldn't tell "create" from "update," would re-send unchanged data, and couldn't confirm that previous exports actually landed. | The import finds **no** cloud object matching Marcus. The engine now knows he must be **created**, not updated. | ✅ Yes |
-| 3a | **Inbound sync** | AD Connector Space → Metaverse | Inbound rules check scope, then **join** the object to an existing MV object or **project** a new one, and flow attributes in. | AD isn't always the only source. A person might exist in two forests (an account forest and a resource forest), so the MV merges every source into **one identity** and resolves conflicts by rule precedence. Scoping filters also drop objects that should never sync, such as critical system objects. | "In from AD – User Join" finds no existing MV object for Marcus, so "In from AD – User Common" **projects** a new MV `person`. His `objectGUID` (via `ms-DS-ConsistencyGuid`) becomes the MV `sourceAnchor`, and `title` flows into `jobTitle`. | ✅ Yes |
-| 3b | **Outbound sync** | Metaverse → Entra Connector Space | Outbound rules **provision** or update the object in the Entra CS. The difference from the current cloud state becomes a **pending export**. | This is where the engine shapes the identity **for the target system**: it filters (`cloudFiltered`), transforms attributes to Entra's schema, and calculates only the **delta** to send. The result is a reviewable to-do list, which is what staging servers let you inspect. | "Out to AAD – User Join" provisions Marcus into the Entra CS as **Pending Export: Add**, with `ImmutableId = Tm9MCx06XkucL32OGis8TQ==` (his GUID in base64). | ✅ Yes |
-| 4 | **Export to AD** *(writeback only)* | AD Connector Space → AD DS | Writes cloud-sourced or engine-generated data back on-prem. | Some features need on-prem AD updated: password writeback (SSPR), group writeback, and stamping `ms-DS-ConsistencyGuid` so the anchor survives a forest migration. | If `ms-DS-ConsistencyGuid` was empty, Connect writes `0b4c6f4e-…` into it on Marcus's AD account. That way, his anchor survives even if he's later moved to another forest. | ❌ No |
-| 5 | **Export to Entra ID** | Entra Connector Space → Entra ID | Pending exports are pushed to the tenant, where objects are created, updated, or deleted. | Only now does a real change hit production. Keeping it as the **last, separate step** lets the engine batch changes, enforce the deletion threshold (500 by default), and skip it entirely in staging mode. | Marcus is created in Entra ID as `mlee@contoso.com` with *Directory synced = Yes*. On the **next Entra import**, the pending export clears, which confirms the create landed. PHS then sends his password hash separately, roughly every 2 minutes. | ❌ No |
+| 3 | **Inbound sync** | AD Connector Space → Metaverse | Inbound rules check scope, then **join** the object to an existing MV object or **project** a new one, and flow attributes in. | AD isn't always the only source. A person might exist in two forests (an account forest and a resource forest), so the MV merges every source into **one identity** and resolves conflicts by rule precedence. Scoping filters also drop objects that should never sync, such as critical system objects. | "In from AD – User Join" finds no existing MV object for Marcus, so "In from AD – User Common" **projects** a new MV `person`. His `objectGUID` (via `ms-DS-ConsistencyGuid`) becomes the MV `sourceAnchor`, and `title` flows into `jobTitle`. | ✅ Yes |
+| 4 | **Outbound sync to Entra CS** | Metaverse → Entra Connector Space | Outbound rules **provision** or update the object in the Entra CS. The difference from the current cloud state becomes a **pending export**. | This is where the engine shapes the identity **for the target system**: it filters (`cloudFiltered`), transforms attributes to Entra's schema, and calculates only the **delta** to send. The result is a reviewable to-do list, which is what staging servers let you inspect. | "Out to AAD – User Join" provisions Marcus into the Entra CS as **Pending Export: Add**, with `ImmutableId = Tm9MCx06XkucL32OGis8TQ==` (his GUID in base64). | ✅ Yes |
+| 5 | **Outbound sync to AD CS** *(writeback only)* | Metaverse → AD Connector Space | Outbound rules to AD stage any values that need to be written back on-prem as **pending exports** in the AD CS. | Some features need data written back to AD, such as password writeback, group writeback, and stamping `ms-DS-ConsistencyGuid`. Like step 4, this only stages the change inside the database. Nothing touches AD yet. | His `ms-DS-ConsistencyGuid` is empty, so the engine stages **Pending Export: Update ms-DS-ConsistencyGuid = 0b4c6f4e-…** on his AD CS object. | ✅ Yes |
+| 6 | **Export to Entra ID** | Entra Connector Space → Entra ID | Pending exports are pushed to the tenant, where objects are created, updated, or deleted. | Only now does a real change hit production. Keeping export as a **separate step after sync** lets the engine batch changes, enforce the deletion threshold (500 by default), and skip it entirely in staging mode. | Marcus is created in Entra ID as `mlee@contoso.com` with *Directory synced = Yes*. On the **next Entra import**, the pending export clears, which confirms the create landed. PHS then sends his password hash separately, roughly every 2 minutes. | ❌ No |
+| 7 | **Export to AD** *(writeback only)* | AD Connector Space → AD DS | Pending exports in the AD CS are written to on-prem AD by the AD DS Connector account. | This is the only step that changes on-prem AD. It runs **last** in the default cycle, after the Entra export. | Connect writes `0b4c6f4e-…` into it on Marcus's AD account. That way, his anchor survives even if he's later moved to another forest. | ❌ No |
 
-> Steps 1, 2, and 3 only read from directories or work inside the database. **Only steps 4 and 5 write to a real directory**, and those are exactly the steps staging mode blocks.
+> Steps 1–5 only read from directories or work inside the database. **Only steps 6 and 7 write to a real directory**, and those are exactly the steps staging mode blocks. Microsoft's documentation groups steps 3–5 into a single "Synchronization" phase, which is why you'll sometimes see the cycle described as five steps.
 
 **How Marcus's attributes transform along the way:**
 
@@ -77,8 +78,8 @@ flowchart LR
 |---|---|
 | 1. Import AD | AD CS shows **Pending Import: Update** (Old: Registered Nurse / New: Charge Nurse). |
 | 2. Import Entra | Cloud still shows `Registered Nurse`. |
-| 3a/3b. Sync | MV `jobTitle` is updated, and the engine sees the Entra CS differs, so it creates **Pending Export: Update jobTitle**. |
-| 5. Export | Entra ID `jobTitle` becomes `Charge Nurse`. Only that one attribute is sent, not his whole object. |
+| 3–4. Sync | MV `jobTitle` is updated, and the engine sees the Entra CS differs, so it creates **Pending Export: Update jobTitle**. |
+| 6. Export | Entra ID `jobTitle` becomes `Charge Nurse`. Only that one attribute is sent, not his whole object. |
 
 **Mental model:** think of it like an airport.
 
@@ -161,38 +162,41 @@ flowchart LR
 
 ---
 
-## 4. The 5 Sync Steps
+## 4. The 7 Sync Steps
 
-From the Microsoft doc, a sync cycle has five logical steps:
+A full sync cycle is **7 actions**. Microsoft's troubleshooting doc groups steps 3–5 into one "Synchronization" phase and calls it five steps, but listing all seven makes each arrow in the diagram match a row in the table.
 
 ```mermaid
 sequenceDiagram
-    autonumber
     participant AD as AD DS
     participant ADCS as AD Connector Space
     participant MV as Metaverse
     participant AADCS as Entra Connector Space
     participant AAD as Entra ID
 
-    AD->>ADCS: Import from AD (objects/changes staged)
-    AAD->>AADCS: Import from Entra ID (cloud state staged)
-    Note over ADCS,AADCS: Synchronization (rules by precedence, low → high)
-    ADCS->>MV: Inbound rules: project/join + attribute flow
-    MV->>AADCS: Outbound rules: provision + attribute flow (pending export)
-    MV->>ADCS: Outbound rules to AD (writeback, if enabled)
-    ADCS->>AD: Export to AD (writeback)
-    AADCS->>AAD: Export to Entra ID
+    AD->>ADCS: 1. Import from AD
+    AAD->>AADCS: 2. Import from Entra ID
+    Note over ADCS,AADCS: Synchronization phase (steps 3–5), rules run by precedence, lower number wins
+    ADCS->>MV: 3. Inbound sync (project/join + attribute flow)
+    MV->>AADCS: 4. Outbound sync to Entra CS (pending export)
+    MV->>ADCS: 5. Outbound sync to AD CS (writeback, pending export)
+    AADCS->>AAD: 6. Export to Entra ID
+    ADCS->>AD: 7. Export to AD (writeback)
 ```
 
-| # | Step | Direction | What actually happens |
-|---|---|---|---|
-| 1 | **Import from AD** | AD → AD CS | Reads in-scope OUs/domains. Changes staged as **pending import** |
-| 2 | **Import from Entra ID** | Entra → Entra CS | Reads cloud state so the engine knows what already exists (and confirms prior exports) |
-| 3 | **Synchronization** | CS ↔ MV | **Inbound** rules: CS → MV. **Outbound** rules: MV → CS. Produces **pending exports** |
-| 4 | **Export to AD** | AD CS → AD | Only for writeback features (password writeback, group writeback, ms-DS-ConsistencyGuid, Exchange hybrid attributes) |
-| 5 | **Export to Entra ID** | Entra CS → Entra | Creates / updates / deletes objects in your tenant |
+| # | Step | Direction | Phase | What actually happens | Touches a real directory? |
+|---|---|---|---|---|---|
+| 1 | **Import from AD** | AD DS → AD CS | Import | Reads in-scope OUs and domains. Changes are staged as **pending import**. | Reads only |
+| 2 | **Import from Entra ID** | Entra ID → Entra CS | Import | Reads the cloud state so the engine knows what already exists, and confirms prior exports. | Reads only |
+| 3 | **Inbound sync** | AD CS → MV | Synchronization | Inbound rules check scope, **join** or **project**, and flow attributes into the MV. | No |
+| 4 | **Outbound sync to Entra CS** | MV → Entra CS | Synchronization | Outbound rules **provision** or update the object and create **pending exports** for Entra ID. | No |
+| 5 | **Outbound sync to AD CS** | MV → AD CS | Synchronization | Outbound rules stage writeback values (password writeback, group writeback, `ms-DS-ConsistencyGuid`, Exchange hybrid attributes) as **pending exports** for AD. | No |
+| 6 | **Export to Entra ID** | Entra CS → Entra ID | Export | Creates, updates, or deletes objects in your tenant. | ✍️ **Writes** |
+| 7 | **Export to AD** | AD CS → AD DS | Export | Writes the staged writeback changes to on-prem AD. | ✍️ **Writes** |
 
-> 💡 **Key insight:** Synchronization **never touches a real directory**. Only Import reads and only Export writes. Sync is purely database-to-database inside the server. This is exactly why staging mode is safe — see [Section 8](#8-staging-mode--the-golden-rule).
+> 💡 **Key insight:** Steps 3–5 **never touch a real directory**. Only imports (1–2) read and only exports (6–7) write. Synchronization is purely database-to-database inside the server, which is exactly why staging mode is safe. See [Section 8](#8-staging-mode--the-golden-rule).
+
+> 🔁 The order matches the default delta cycle in [Section 7](#7-run-profiles--the-scheduler): the Entra export (6) runs **before** the AD export (7).
 
 ---
 
